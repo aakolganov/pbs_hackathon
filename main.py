@@ -60,6 +60,30 @@ class ParticleSimulation:
         self.velocities = np.zeros((config.NUM_PARTICLES, 2))
         self.particles = None
         self.file_counter = 0
+        
+        # Optimization: specific set to track particle pairs currently in collision
+        self.last_step_collisions = set()
+        
+    def _detect_and_resolve_pair(self, i: int, j: int, current_step_collisions: set) -> None:
+        """
+        Helper function to check collision between two specific particles (i and j).
+        Uses squared distance to avoid costly square root operations for the check.
+        """
+        # Optimization: Use squared distance to avoid sqrt() unless necessary
+        r_diff = self.positions[i] - self.positions[j]
+        dist_sq = np.dot(r_diff, r_diff)
+        min_dist = self.radii[i] + self.radii[j]
+        
+        if dist_sq < min_dist**2:
+            # Sort indices to ensure unique pair identification (smaller, larger)
+            pair = tuple(sorted((i, j)))
+            
+            # "Sticky" check: Only resolve if they weren't colliding last step
+            if pair not in self.last_step_collisions:
+                self.resolve_collision(i, j)
+            
+            # Record this collision so we don't resolve it again next frame if they overlap
+            current_step_collisions.add(pair)
 
     def save_state(self, filename: str) -> None:
         """
@@ -151,7 +175,6 @@ class ParticleSimulation:
             self.config.MAX_VELOCITY,
             (self.config.NUM_PARTICLES, 2)
         )
-
     def check_collisions_v1(self) -> None:
         """
         Checks for collisions among particles and resolves them if detected.
@@ -166,6 +189,103 @@ class ParticleSimulation:
                 dist = np.linalg.norm(self.positions[i] - self.positions[j])
                 if dist < (self.radii[i] + self.radii[j]):
                     self.resolve_collision(i, j)
+
+    def check_collisions_v2(self) -> None:
+        """
+        Optimized collision detection that prevents 'sticky' collisions.
+        
+        It maintains a record of overlapping particles from the previous step.
+        Collision resolution (bouncing) is only applied if the pair was NOT 
+        overlapping in the previous step.
+        """
+        current_step_collisions = set()
+        
+        for i in range(self.config.NUM_PARTICLES):
+            for j in range(i + 1, self.config.NUM_PARTICLES):
+                dist = np.linalg.norm(self.positions[i] - self.positions[j])
+                
+                # Check if they are overlapping
+                if dist < (self.radii[i] + self.radii[j]):
+                    pair = (i, j)
+                    
+                    # Only resolve if they were not already colliding in the last step
+                    if pair not in self.last_step_collisions:
+                        self.resolve_collision(i, j)
+                    
+                    # Add to the set for the next step's memory
+                    current_step_collisions.add(pair)
+        
+        # Update the memory for the next frame
+        self.last_step_collisions = current_step_collisions
+        
+    def check_collisions_v3(self) -> None:
+        """
+        Spatial Partitioning (Cell List) implementation.
+        1. Buckets particles into a grid.
+        2. Checks collisions only between particles in the same or adjacent cells.
+        """
+        # 1. Determine grid size
+        # Cell size must be at least the max diameter to guarantee we don't miss 
+        # collisions across non-adjacent cells.
+        max_diameter = 2 * self.config.MAX_RADIUS
+        
+        # Number of cells per dimension (ensure at least 1)
+        n_cells = int(self.config.BOX_SIZE // max_diameter)
+        if n_cells < 1: n_cells = 1
+        
+        cell_size = self.config.BOX_SIZE / n_cells
+        
+        # 2. Build the Grid
+        # Key: (x_index, y_index), Value: list of particle indices
+        grid = {}
+        
+        for i in range(self.config.NUM_PARTICLES):
+            # Calculate grid coordinates
+            cx = int(self.positions[i, 0] // cell_size)
+            cy = int(self.positions[i, 1] // cell_size)
+            
+            # Clamp to valid range to handle boundary precision errors
+            cx = max(0, min(cx, n_cells - 1))
+            cy = max(0, min(cy, n_cells - 1))
+            
+            if (cx, cy) not in grid:
+                grid[(cx, cy)] = []
+            grid[(cx, cy)].append(i)
+
+        # 3. Check Collisions
+        current_step_collisions = set()
+        
+        # Neighbors to check: Self + 4 surrounding cells (Half-shell method)
+        # This ensures every pair of cells is checked exactly once.
+        # Offsets: Center, East, North-East, North, North-West
+        neighbor_offsets = [(0, 0), (1, 0), (1, 1), (0, 1), (-1, 1)]
+        
+        for (cx, cy), cell_particles in grid.items():
+            for dx, dy in neighbor_offsets:
+                nx, ny = cx + dx, cy + dy
+                
+                # If the neighbor cell exists in our populated grid
+                if (nx, ny) in grid:
+                    neighbor_particles = grid[(nx, ny)]
+                    
+                    if dx == 0 and dy == 0:
+                        # Case A: Within the SAME cell
+                        # Check unique pairs: i vs j where j > i
+                        for idx_a in range(len(cell_particles)):
+                            i = cell_particles[idx_a]
+                            for idx_b in range(idx_a + 1, len(cell_particles)):
+                                j = cell_particles[idx_b]
+                                self._detect_and_resolve_pair(i, j, current_step_collisions)
+                    else:
+                        # Case B: Between DIFFERENT cells
+                        # Check all particles in Cell A vs all in Cell B
+                        for i in cell_particles:
+                            for j in neighbor_particles:
+                                self._detect_and_resolve_pair(i, j, current_step_collisions)
+                                
+        # Update history for the next step
+        self.last_step_collisions = current_step_collisions
+
 
     def resolve_collision(self, i: int, j: int) -> None:
         """
@@ -217,15 +337,21 @@ class ParticleSimulation:
                 if (self.positions[i, d] - self.radii[i] < 0 or
                         self.positions[i, d] + self.radii[i] > self.config.BOX_SIZE):
                     self.velocities[i, d] *= -1
-
+                    
         start_time = time.time()
+        
+        # --- SELECTION LOGIC ---
         if self.config.COLLISION_VERSION == 1:
             self.check_collisions_v1()
-        # elif self.config.COLLISION_VERSION == 2:
-        #     self.check_collisions_v2()
+        elif self.config.COLLISION_VERSION == 2:
+            self.check_collisions_v2()
+        elif self.config.COLLISION_VERSION == 3:
+            self.check_collisions_v3()  # <--- NEW CALL
         else:
             print(f'Error! Unknown implementation: {self.config.COLLISION_VERSION}')
             exit(1)
+        # -----------------------
+
         elapsed_time = time.time() - start_time
         self.total_elapsed_time += elapsed_time
         print(f'\nStep: {step}')
@@ -328,7 +454,7 @@ def main():
     print(f'Files limit: {config.FILES_LIMIT}')
     print(f'Repeat animation: {config.REPEAT_ANIMATION}')
 
-    simulation.run_simulation(num_steps=10, animate=args.animate == '1')
+    simulation.run_simulation(num_steps=10, animate=args.animate == '0')
 
 
 if __name__ == '__main__':
